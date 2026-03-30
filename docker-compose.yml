@@ -1,0 +1,132 @@
+# MLOps platform — local stack (from README.md)
+# ---------------------------------------------------------------------------
+# Architecture this file supports:
+#   [ FastAPI API ] → [ Temporal ] → [ activities ] → [ runners (subprocess) ]
+#       → [ PyTorch + HF ] with [ MLflow + MinIO/S3 + Postgres ]
+#
+# What runs here (infra): Postgres, Temporal (+ UI), MinIO, MLflow tracking.
+# What you add next (Phase 1): FastAPI service + Temporal worker pointing at
+#   temporal:7233 and this Postgres; training stays out-of-process per README.
+# ---------------------------------------------------------------------------
+
+name: loom
+
+services:
+  # --- Storage & metadata (README: S3/MinIO + Postgres) ---
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -d temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [mlops]
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio12345
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [mlops]
+
+  # Creates the mlflow bucket for artifact roots (s3://mlflow/)
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minio minio12345 &&
+      mc mb local/mlflow --ignore-existing
+      "
+    networks: [mlops]
+
+  # --- Orchestration (README: Temporal workflows / activities) ---
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: postgres
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CLI_ADDRESS: temporal:7233
+    ports:
+      - "7233:7233"
+    networks: [mlops]
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    depends_on:
+      - temporal
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000,http://localhost:8080
+    ports:
+      - "8080:8080"
+    networks: [mlops]
+
+  # --- Experiment tracking (README: MLflow — params, metrics, artifacts) ---
+  # Official MLflow image omits psycopg2; extend it for Postgres backend store.
+  mlflow:
+    build:
+      context: ./infra/docker/mlflow
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio12345
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_DEFAULT_REGION: us-east-1
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://mlflow:mlflow@postgres:5432/mlflow
+      --default-artifact-root s3://mlflow/
+    ports:
+      - "5000:5000"
+    networks: [mlops]
+
+  # Temporal CLI: docker run --rm -it --network loom_mlops
+  #   -e TEMPORAL_CLI_ADDRESS=temporal:7233 temporalio/admin-tools:latest tctl ...
+
+networks:
+  mlops:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
